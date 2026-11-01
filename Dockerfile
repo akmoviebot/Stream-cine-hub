@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y gcc libffi-dev && rm -rf /var/lib/apt/l
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY main.py .
 
 EXPOSE 8080
 

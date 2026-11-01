@@ -1,8 +1,8 @@
 import os
 import math
 import asyncio
-import inspect
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, raw
+from pyrogram.file_id import FileId
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiohttp import web
 
@@ -59,11 +59,10 @@ async def handle_media(client, message):
     wait_msg = await message.reply_text("⚡ *Processing file & creating CineHubPro links...*", quote=True)
 
     try:
-        # File ko BIN_CHANNEL me forward karein taaki permanent streaming id generate ho
         forwarded = await media.forward(BIN_CHANNEL)
         file_id = forwarded.id
     except Exception as e:
-        await wait_msg.edit_text(f"❌ **Error:** Bin channel forward failed. Make sure Bot is Admin in `BIN_CHANNEL`.\n`{str(e)}`")
+        await wait_msg.edit_text(f"❌ **Error:** Make sure Bot is Admin in `BIN_CHANNEL`.\n`{str(e)}`")
         return
 
     file_name = media.file_name or "CineHubPro_Media.mp4"
@@ -167,7 +166,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="player-card">
       <div class="media-title">__FILE_NAME__</div>
       <div class="alert-box">
-        <i class="fa-solid fa-circle-exclamation"></i> <strong>Audio Tip:</strong> Multi-channel audio me browser me aawaz na aaye to VLC ya MX Player chalaayein.
+        <i class="fa-solid fa-circle-exclamation"></i> <strong>Audio Tip:</strong> Sound na aane par VLC ya MX Player button dabayein.
       </div>
 
       <video controls playsinline controlsList="nodownload">
@@ -196,9 +195,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-# --- KOYEB HEALTH CHECK & STREAMING ROUTES ---
+# --- KOYEB HEALTH CHECK HANDLER ---
 async def health_check(request):
-    # Koyeb HEAD aur GET dono ping bhejta hai
+    # Koyeb HEAD aur GET dono requests bhejta hai, yeh dono pe 200 OK dega
     return web.Response(text="CineHubPro Streaming Core is Online! ⚡", status=200)
 
 async def watch_handler(request):
@@ -220,6 +219,50 @@ async def watch_handler(request):
                          .replace("__CHANNEL_LINK__", CHANNEL_LINK)
     return web.Response(text=html, content_type="text/html")
 
+# MTProto Chunk Generator (Vanilla Pyrogram support)
+async def custom_streamer(client, media, from_bytes, until_bytes):
+    file_id = FileId.decode(media.file_id)
+    location = raw.types.InputDocumentFileLocation(
+        id=file_id.media_id,
+        access_hash=file_id.access_hash,
+        file_reference=file_id.file_reference
+    )
+    chunk_size = 512 * 1024
+    aligned_offset = (from_bytes // 4096) * 4096
+    offset_drop = from_bytes - aligned_offset
+    bytes_to_serve = (until_bytes - from_bytes) + 1
+    
+    bytes_yielded = 0
+    current_offset = aligned_offset
+    
+    while bytes_yielded < bytes_to_serve:
+        fetch_size = min(chunk_size, 1048576)
+        try:
+            res = await client.invoke(
+                raw.functions.upload.GetFile(
+                    location=location,
+                    offset=current_offset,
+                    limit=fetch_size
+                )
+            )
+        except Exception:
+            break
+            
+        if not isinstance(res, raw.types.upload.File) or not res.bytes:
+            break
+            
+        chunk = res.bytes
+        if offset_drop > 0:
+            chunk = chunk[offset_drop:]
+            offset_drop = 0
+            
+        if len(chunk) > (bytes_to_serve - bytes_yielded):
+            chunk = chunk[:(bytes_to_serve - bytes_yielded)]
+            
+        yield chunk
+        bytes_yielded += len(chunk)
+        current_offset += len(res.bytes)
+
 async def raw_media_stream(request):
     try:
         file_id = int(request.match_info["file_id"])
@@ -239,7 +282,6 @@ async def raw_media_stream(request):
         if len(ranges) > 1 and ranges[1]:
             until_bytes = int(ranges[1])
 
-    chunk_size = 1024 * 1024
     status = 206 if range_header else 200
     headers = {
         "Content-Type": media.mime_type or "video/mp4",
@@ -254,19 +296,22 @@ async def raw_media_stream(request):
     response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
 
-    async for chunk in bot.stream_media(message=msg, limit=until_bytes - from_bytes + 1, offset=from_bytes // chunk_size):
-        await response.write(chunk)
+    if hasattr(bot, "stream_media"):
+        async for chunk in bot.stream_media(message=msg, limit=until_bytes - from_bytes + 1, offset=from_bytes // (1024*1024)):
+            await response.write(chunk)
+    else:
+        async for chunk in custom_streamer(bot, media, from_bytes, until_bytes):
+            await response.write(chunk)
 
     return response
 
-# --- ASYNC RUNNER ---
+# --- ASYNC MAIN RUNNER ---
 async def main():
-    # 1. Koyeb ke HEAD aur GET requests ke liye web routes
     app_server = web.Application()
-    app_server.router.add_get("/", health_check)
-    app_server.router.add_head("/", health_check)
-    app_server.router.add_get("/health", health_check)
-    app_server.router.add_head("/health", health_check)
+    
+    # '*' method use kiya hai taaki GET, HEAD sab handle ho jaye aur crash na ho
+    app_server.router.add_route("*", "/", health_check)
+    app_server.router.add_route("*", "/health", health_check)
     app_server.router.add_get("/watch/{file_id}", watch_handler)
     app_server.router.add_get("/download/{file_id}", raw_media_stream)
     app_server.router.add_get("/stream/{file_id}", raw_media_stream)
@@ -277,17 +322,13 @@ async def main():
     await site.start()
     print(f"Web server running on port {PORT}")
 
-    # 2. Pyrogram Bot ko start karein (Sync/Async safe)
-    start_result = bot.start()
-    if inspect.isawaitable(start_result):
-        await start_result
-
+    await bot.start()
     print("CineHubPro Bot started successfully!")
+    
     await idle()
-
-    stop_result = bot.stop()
-    if inspect.isawaitable(stop_result):
-        await stop_result
+    
+    await bot.stop()
+    await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
